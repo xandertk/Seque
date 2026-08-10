@@ -1,0 +1,7 @@
+*.py text eol=lf
+*.md text eol=lf
+*.bat text eol=crlf
+*.pri text eol=crlf
+*.json text eol=lf
+*.slim binary
+*.sli text
