@@ -39,9 +39,20 @@ import statistics
 import sys
 import zipfile
 from collections import defaultdict, deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
+
+from fix_pri_geometry import (
+    DEFAULT_MIN_ANGLE as DEFAULT_GEOMETRY_MIN_ANGLE,
+    DEFAULT_MIN_DISTANCE as DEFAULT_GEOMETRY_MIN_DISTANCE,
+    GeometryFixError,
+    GeometryFixSummary,
+    add_excavation_stages as add_excavation_stage_geometry,
+    ProgressCallback,
+    clean_pri_geometry,
+    remove_bolt_geometry,
+)
 
 
 PRI_VERSION = "2.2.0"
@@ -120,6 +131,7 @@ class ValidationSummary:
     boundary_edges: int
     internal_edges: int
     water_table_vertices: int
+    geometry_fix: GeometryFixSummary | None = None
 
 
 SECTION_RE_TEMPLATE = r"(?ms)^%s:\s*\n(.*?)(?=^[^\s#][^\n]*:\s*(?:\n|$)|\Z)"
@@ -1210,15 +1222,80 @@ def convert(
     report_path: Path | None = None,
     include_mesh: bool = False,
     include_water_table: bool = True,
+    fix_geometry: bool = False,
+    add_excavation_stages: bool = False,
+    excavation_stage_count: int = 4,
+    excavation_top_point: tuple[float, float] | None = None,
+    remove_bolts: bool = False,
+    geometry_min_distance: float = DEFAULT_GEOMETRY_MIN_DISTANCE,
+    geometry_min_angle: float = DEFAULT_GEOMETRY_MIN_ANGLE,
+    preserve_geometry_area_count: bool = True,
+    progress: ProgressCallback | None = None,
 ) -> ValidationSummary:
+    if progress is not None:
+        progress(f"reading Slide file: {input_path.name}")
     text, sli_member = read_sli_from_slim(input_path)
+    if progress is not None:
+        progress("parsing Slide model")
     model = parse_slide_model(text)
+    if progress is not None:
+        progress("building PRI geometry")
     mesh = build_pri_mesh(model, include_water_table=include_water_table)
+    if progress is not None:
+        progress(f"validating reconstructed geometry: {len(mesh.geometry_vertices)} vertices")
     summary = validate_mesh(model, mesh)
+    if progress is not None:
+        progress(f"writing PRI: {output_path}")
     write_pri(output_path, model, mesh, include_mesh=include_mesh)
+    if remove_bolts:
+        if progress is not None:
+            progress("starting bolt and anchor cleanup")
+        try:
+            remove_bolt_geometry(output_path, output_path, progress=progress)
+        except GeometryFixError as exc:
+            raise ConversionError(f"Bolt cleanup failed: {exc}") from exc
+    if fix_geometry:
+        if progress is not None:
+            progress("starting PRI geometry cleanup")
+        try:
+            geometry_fix = clean_pri_geometry(
+                output_path,
+                output_path,
+                minimum_distance=geometry_min_distance,
+                minimum_angle=geometry_min_angle,
+                preserve_area_count=preserve_geometry_area_count,
+                progress=progress,
+            )
+        except GeometryFixError as exc:
+            raise ConversionError(f"Geometry cleanup failed: {exc}") from exc
+        summary = replace(summary, geometry_fix=geometry_fix)
+    if add_excavation_stages:
+        if progress is not None:
+            progress(f"starting {excavation_stage_count}-stage excavation extension using user top point")
+        try:
+            add_excavation_stage_geometry(
+                output_path,
+                output_path,
+                stage_count=excavation_stage_count,
+                top_point=excavation_top_point,
+                progress=progress,
+            )
+        except GeometryFixError as exc:
+            raise ConversionError(f"Excavation-stage extension failed: {exc}") from exc
+        summary = replace(
+            summary,
+            areas=summary.areas + excavation_stage_count,
+            borders=summary.borders + excavation_stage_count,
+        )
+    if progress is not None:
+        progress("validating written PRI")
     validate_written_pri(output_path)
     if report_path is not None:
+        if progress is not None:
+            progress(f"writing report: {report_path}")
         write_report(report_path, input_path, sli_member, model, summary)
+    if progress is not None:
+        progress("conversion complete")
     return summary
 
 
@@ -1245,6 +1322,46 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not transfer the Slide water table as a PRI WaterLevel border.",
     )
+    parser.add_argument(
+        "--fix-geometry",
+        action="store_true",
+        help="Run PRI geometry cleanup after conversion before ProRock meshing.",
+    )
+    parser.add_argument(
+        "--add-excavation-stages",
+        action="store_true",
+        help="Detect a left or right pit wall and add equal-height excavation stages after geometry cleanup.",
+    )
+    parser.add_argument(
+        "--excavation-stage-count",
+        type=int,
+        default=4,
+        help="Number of equal-height excavation stages. Default: 4.",
+    )
+    parser.add_argument("--excavation-top-x", type=float, help="X coordinate of an ExternalBorders excavation-top vertex.")
+    parser.add_argument("--excavation-top-y", type=float, help="Y coordinate of an ExternalBorders excavation-top vertex.")
+    parser.add_argument(
+        "--remove-bolts",
+        action="store_true",
+        help="Remove explicitly labelled bolt, anchor and support geometry before cleanup.",
+    )
+    parser.add_argument(
+        "--geometry-min-distance",
+        type=float,
+        default=DEFAULT_GEOMETRY_MIN_DISTANCE,
+        help="Merge geometry vertices closer than this distance in metres when --fix-geometry is used. Default: 2.",
+    )
+    parser.add_argument(
+        "--geometry-min-angle",
+        type=float,
+        default=DEFAULT_GEOMETRY_MIN_ANGLE,
+        help="Report and clean simple geometry angles smaller than this value in degrees. Default: 18.",
+    )
+    parser.add_argument(
+        "--allow-geometry-area-count-change",
+        action="store_true",
+        help="Allow geometry cleanup to change the reconstructed CAD face count.",
+    )
     return parser
 
 
@@ -1263,6 +1380,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             report_path,
             include_mesh=args.keep_mesh,
             include_water_table=not args.no_water,
+            fix_geometry=args.fix_geometry,
+            add_excavation_stages=args.add_excavation_stages,
+            excavation_stage_count=args.excavation_stage_count,
+            excavation_top_point=(args.excavation_top_x, args.excavation_top_y)
+            if args.excavation_top_x is not None and args.excavation_top_y is not None
+            else None,
+            remove_bolts=args.remove_bolts,
+            geometry_min_distance=args.geometry_min_distance,
+            geometry_min_angle=args.geometry_min_angle,
+            preserve_geometry_area_count=not args.allow_geometry_area_count_change,
         )
     except ConversionError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -1286,6 +1413,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"  internal edges:    {summary.internal_edges}")
     if summary.water_table_vertices:
         print(f"  water table:       {summary.water_table_vertices} vertices transferred")
+    if summary.geometry_fix is not None:
+        fix = summary.geometry_fix
+        print("  geometry cleanup:")
+        if fix.backup_path is not None:
+            print(f"    base copy:       {fix.backup_path}")
+        print(f"    errors:          {fix.errors_before} -> {fix.errors_after}")
+        print(f"    vertices:        {fix.vertices_before} -> {fix.vertices_after}")
+        print(f"    close pairs:     {fix.close_pairs_before} -> {fix.close_pairs_after}")
+        print(f"    near segments:   {fix.near_segments_before} -> {fix.near_segments_after}")
+        print(f"    near edges:      {fix.near_fixed_edges_before} -> {fix.near_fixed_edges_after}")
+        print(f"    near material:   {fix.near_material_segments_before} -> {fix.near_material_segments_after}")
+        print(f"    small angles:    {fix.small_angles_before} -> {fix.small_angles_after}")
+        if fix.spread_vertex_pairs:
+            print(f"    spread pairs:    {fix.spread_vertex_pairs}")
+        if fix.spread_bad_parts:
+            print(f"    spread bad parts: {fix.spread_bad_parts}")
+        if fix.warnings:
+            for warning in fix.warnings:
+                print(f"    WARNING: {warning}")
     print("  WARNING: ProRock mechanical element/joint properties are zero by design.")
     if report_path is not None:
         print(f"  report:            {report_path}")
